@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: ai-assistant-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health/db
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: OLLAMA_BASE_URL
+        value: http://ai-assistant-ollama:11434
+      - key: OLLAMA_MODEL
+        value: qwen2.5:3b
+      - key: OLLAMA_EMBED_MODEL
+        value: nomic-embed-text
+
+  - type: pserv
+    name: ai-assistant-ollama
+    runtime: docker
+    dockerfilePath: ./Dockerfile.ollama
+    disk:
+      name: ollama-data
+      mountPath: /root/.ollama
+      sizeGB: 10
+    envVars:
+      - key: OLLAMA_MODEL
+        value: qwen2.5:3b
+      - key: OLLAMA_EMBED_MODEL
+        value: nomic-embed-text
