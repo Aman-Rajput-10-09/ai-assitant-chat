@@ -1,3 +1,5 @@
+import re
+
 from models.domain import Student
 
 
@@ -13,6 +15,7 @@ CGPA_SORT_KEYWORDS = {
 SINGLE_RESULT_KEYWORDS = {
     "only one",
     "one student",
+    "one students",
     "single student",
     "top student",
     "best student",
@@ -30,7 +33,11 @@ class RankingEngine:
 
     def requested_result_limit(self, question: str) -> int | None:
         normalized = question.casefold()
-        if any(keyword in normalized for keyword in SINGLE_RESULT_KEYWORDS):
+        if "students" in normalized:
+            return None
+        if any(re.search(rf"\b{re.escape(keyword)}\b", normalized) for keyword in SINGLE_RESULT_KEYWORDS):
+            return 1
+        if "student" in normalized and "students" not in normalized:
             return 1
         return None
 

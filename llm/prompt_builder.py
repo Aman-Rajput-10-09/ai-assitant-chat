@@ -70,3 +70,34 @@ def build_no_results_prompt(question: str, role: str, filters: dict[str, object]
         f"Question: {question}\n"
         f"Applied filters: {json.dumps(filters, default=str)}"
     )
+
+
+def build_filter_system_prompt(format_instructions: str) -> str:
+    return (
+        "You convert professor questions into structured JSON filters for a student dataset. "
+        "Return only valid JSON. Use only these exact fields: name, cgpa, skills, activities, projects. "
+        "For list fields like skills, activities, and projects, prefer contains instead of eq. "
+        "Do not invent new fields. If a field is not explicitly implied, omit it. "
+        "Broad words like technical, AI, backend, frontend, startup, communication, leadership, "
+        "and competitive programming should map to the closest valid field. "
+        f"{format_instructions}"
+    )
+
+
+def build_response_system_prompt() -> str:
+    return (
+        "You are a concise academic assistant. "
+        "Write one short, natural sentence for the API answer field. "
+        "Do not mention filters, embeddings, ranking logic, memory, retrieval, or internal scoring. "
+        "If exactly one student is selected, mention the student's name. "
+        "If multiple students are selected, summarize the result briefly. "
+        "Do not use markdown."
+    )
+
+
+def build_no_results_system_prompt() -> str:
+    return (
+        "You are a concise academic assistant. "
+        "Write one short, natural sentence explaining that no students were found for the request. "
+        "Use polite clear English. Do not mention internal system details. Do not use markdown."
+    )

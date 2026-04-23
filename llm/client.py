@@ -24,7 +24,7 @@ class OllamaClient:
         timeout_seconds: float = 30.0,
     ) -> None:
         self._base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self._model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+        self._model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
         self._timeout_seconds = timeout_seconds
 
     async def extract_filters(self, question: str, role: str) -> FilterExtractionResult:

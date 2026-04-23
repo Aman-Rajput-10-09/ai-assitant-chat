@@ -1,45 +1,53 @@
 from functools import lru_cache
 
-from llm.client import OllamaClient
-from llm.embedding_client import EmbeddingClient
+from data.student_repository import StudentRepository
 from llm.filter_normalizer import FilterNormalizer
+from llm.langchain_client import LangChainOllamaClient
+from llm.langchain_embeddings import LangChainEmbeddingClient
 from llm.rule_based_parser import RuleBasedParser
-from models.filters import FilterCondition, FilterExtractionResult
-from query_engine.retriever import StudentRetriever
+from models.api import AskRequest, AskResponse
+from models.domain import Student
+from query_engine.chroma_retriever import ChromaStudentRetriever
 from query_engine.filter_engine import QueryEngine
 from query_engine.ranking_engine import RankingEngine
-from query_engine.vector_store import InMemoryVectorStore
-from data.mock_students import MOCK_STUDENTS
-from models.api import AskRequest, AskResponse
+from services.chat_memory_service import ChatMemoryService
 
 
 class AssistantService:
     def __init__(
         self,
-        llm_client: OllamaClient,
+        llm_client: LangChainOllamaClient,
         query_engine: QueryEngine,
         rule_parser: RuleBasedParser,
         filter_normalizer: FilterNormalizer,
         ranking_engine: RankingEngine,
-        embedding_client: EmbeddingClient,
-        retriever: StudentRetriever,
+        retriever: ChromaStudentRetriever,
+        memory_service: ChatMemoryService,
+        student_repository: StudentRepository,
     ) -> None:
         self._llm_client = llm_client
         self._query_engine = query_engine
         self._rule_parser = rule_parser
         self._filter_normalizer = filter_normalizer
         self._ranking_engine = ranking_engine
-        self._embedding_client = embedding_client
         self._retriever = retriever
-        self._retriever_ready = False
+        self._memory_service = memory_service
+        self._student_repository = student_repository
 
     async def ask(self, payload: AskRequest) -> AskResponse:
+        students = await self._load_students()
+        self._retriever.ensure_index(students)
+        memory_scope = self._memory_scope(payload)
+        history = self._memory_service.get_recent_messages(memory_scope)
+
         llm_result = await self._llm_client.extract_filters(
             question=payload.question,
             role=payload.role,
+            history=history,
         )
         rule_result = self._rule_parser.parse(payload.question)
         final_filters = self._filter_normalizer.normalize(llm_result, rule_result)
+
         ranking_applied = self._ranking_engine.should_rank(payload.question)
         final_filters = self._adjust_filters_for_ranking(
             question=payload.question,
@@ -48,48 +56,54 @@ class AssistantService:
             rule_filters=rule_result.filters,
             ranking_applied=ranking_applied,
         )
-        matched_students = self._query_engine.filter_data(
-            data=MOCK_STUDENTS,
-            filters=final_filters.filters,
-        )
-        semantic_matches = await self._retrieve_semantic_matches(payload.question)
-        use_semantic_fallback = self._should_use_semantic_fallback(
-            question=payload.question,
-            filters=final_filters,
-            matched_students=matched_students,
-        )
-        if not matched_students and semantic_matches and use_semantic_fallback:
-            matched_students = semantic_matches
 
-        ranked_students = matched_students
-        if ranking_applied:
-            ranked_students = self._ranking_engine.rank_students(matched_students, payload.question)
-        requested_limit = self._ranking_engine.requested_result_limit(payload.question)
-        if requested_limit is not None:
-            ranked_students = ranked_students[:requested_limit]
-
-        filter_count = len(final_filters.filters)
-        if ranked_students:
-            answer = self._build_success_answer(
-                question=payload.question,
-                students=ranked_students,
-                filter_count=filter_count,
-                ranking_applied=ranking_applied,
-                used_semantic_fallback=use_semantic_fallback and bool(semantic_matches),
+        if final_filters.filters:
+            matched_students = self._query_engine.filter_data(
+                data=students,
+                filters=final_filters.filters,
             )
         else:
-            answer = await self._llm_client.generate_no_results_answer(
+            matched_students = []
+
+        if ranking_applied and not final_filters.filters:
+            matched_students = students
+
+        semantic_students = self._retrieve_semantic_students(payload.question, students)
+        if not matched_students and self._should_use_semantic_fallback(payload.question, final_filters.filters):
+            matched_students = semantic_students
+
+        selected_students = matched_students
+        if ranking_applied:
+            selected_students = self._ranking_engine.rank_students(selected_students, payload.question)
+
+        requested_limit = self._ranking_engine.requested_result_limit(payload.question)
+        if requested_limit is not None:
+            selected_students = selected_students[:requested_limit]
+
+        if selected_students:
+            answer = self._build_success_answer(selected_students, requested_limit)
+        else:
+            answer = await self._llm_client.generate_answer(
                 question=payload.question,
                 role=payload.role,
-                filters={key: value.model_dump() for key, value in final_filters.filters.items()},
+                history=history,
+                students=selected_students,
+                requested_limit=requested_limit,
+                no_results=True,
             )
+        user_message, ai_message = self._llm_client.build_exchange_messages(
+            question=payload.question,
+            answer=answer,
+        )
+        self._memory_service.add_exchange(memory_scope, [user_message, ai_message])
 
         return AskResponse(
             answer=answer,
-            data=ranked_students,
+            data=selected_students,
             meta={
                 "role": payload.role,
-                "matched_count": len(ranked_students),
+                "professor_id": payload.professor_id,
+                "matched_count": len(selected_students),
             },
         )
 
@@ -105,69 +119,32 @@ class AssistantService:
             return final_filters
 
         normalized_question = question.casefold()
+        if not self._has_explicit_filter_intent(normalized_question):
+            final_filters.filters.clear()
+            return final_filters
+
         if "cgpa" not in normalized_question and "cgpa" in final_filters.filters:
             if "cgpa" in llm_filters and "cgpa" not in rule_filters:
                 final_filters.filters.pop("cgpa", None)
-
         return final_filters
 
-    def _build_success_answer(
-        self,
-        question: str,
-        students: list,
-        filter_count: int,
-        ranking_applied: bool,
-        used_semantic_fallback: bool,
-    ) -> str:
-        top_student = students[0]
-        requested_limit = self._ranking_engine.requested_result_limit(question)
+    def _retrieve_semantic_students(self, question: str, students: list[Student]) -> list[Student]:
+        documents = self._retriever.retrieve(question=question, top_k=3)
+        student_names: list[str] = []
+        for document in documents:
+            name = str(document.metadata.get("student_name", ""))
+            if name and name not in student_names:
+                student_names.append(name)
 
-        if requested_limit == 1 and ranking_applied:
-            if self._ranking_engine.should_sort_by_cgpa(question):
-                return f"{top_student.name} is the top student for this request."
-            return f"{top_student.name} is the top student for this request."
-
-        if ranking_applied and self._ranking_engine.should_sort_by_cgpa(question):
-            return f"I found {self._student_count_phrase(len(students))} for this request."
-
-        if ranking_applied:
-            return f"I found {self._student_count_phrase(len(students))} for this request."
-
-        if used_semantic_fallback:
-            return f"I found {self._student_count_phrase(len(students), qualifier='relevant')} for this request."
-
-        return f"I found {self._student_count_phrase(len(students))} for this request."
-
-    def _student_count_phrase(self, count: int, qualifier: str | None = None) -> str:
-        noun = "student" if count == 1 else "students"
-        if qualifier:
-            return f"{count} {qualifier} {noun}"
-        return f"{count} {noun}"
-
-    async def _retrieve_semantic_matches(self, question: str) -> list:
-        await self._ensure_retriever_index()
-        query_vector = (await self._embedding_client.embed_texts([question]))[0]
-        return self._retriever.retrieve(query_text=question, query_vector=query_vector, top_k=3)
-
-    async def _ensure_retriever_index(self) -> None:
-        if self._retriever_ready:
-            return
-
-        student_documents = self._retriever.student_documents(MOCK_STUDENTS)
-        vectors = await self._embedding_client.embed_texts(student_documents)
-        self._retriever.index_students(MOCK_STUDENTS, vectors)
-        self._retriever_ready = True
+        students_by_name = {student.name: student for student in students}
+        return [students_by_name[name] for name in student_names if name in students_by_name]
 
     def _should_use_semantic_fallback(
         self,
         question: str,
-        filters: FilterExtractionResult,
-        matched_students: list,
+        filters: dict,
     ) -> bool:
-        if matched_students:
-            return False
-
-        if not filters.filters:
+        if not filters:
             return True
 
         normalized_question = question.casefold()
@@ -187,33 +164,83 @@ class AssistantService:
             "backend",
             "frontend",
             "software",
+            "startup",
         }
+        return any(keyword in normalized_question for keyword in broad_intent_keywords)
 
-        if not any(keyword in normalized_question for keyword in broad_intent_keywords):
-            return False
+    def _build_success_answer(
+        self,
+        students: list[Student],
+        requested_limit: int | None,
+    ) -> str:
+        if requested_limit == 1 or len(students) == 1:
+            return f"{students[0].name} is the best match for this request."
 
-        return all(self._is_semantic_friendly_filter(condition) for condition in filters.filters.values())
+        if len(students) == 2:
+            return f"{students[0].name} and {students[1].name} are good matches for this request."
 
-    def _is_semantic_friendly_filter(self, condition: FilterCondition) -> bool:
-        return (
-            condition.gt is None
-            and condition.lt is None
-            and (
-                isinstance(condition.contains, str)
-                or isinstance(condition.eq, str)
+        if len(students) == 3:
+            return (
+                f"I found 3 relevant students for this request: {students[0].name}, "
+                f"{students[1].name}, and {students[2].name}."
             )
-        )
+
+        return f"I found {len(students)} relevant students for this request."
+
+    def _has_explicit_filter_intent(self, normalized_question: str) -> bool:
+        explicit_indicators = {
+            "cgpa",
+            "skill",
+            "skills",
+            "project",
+            "projects",
+            "activity",
+            "activities",
+            "hackathon",
+            "research",
+            "communication",
+            "leadership",
+            "teamwork",
+            "technical",
+            "ai",
+            "backend",
+            "frontend",
+            "software",
+            "startup",
+            ">",
+            "<",
+            "=",
+            "with",
+            "who have",
+            "students in",
+        }
+        return any(indicator in normalized_question for indicator in explicit_indicators)
+
+    def _memory_scope(self, payload: AskRequest) -> str:
+        if payload.professor_id:
+            return f"{payload.role.casefold()}:{payload.professor_id.casefold()}"
+        return payload.role.casefold()
+
+    async def _load_students(self) -> list[Student]:
+        students = await self._student_repository.list_students()
+        if not students:
+            raise ValueError("No student profiles were found in the database.")
+        return students
 
 
 @lru_cache
 def get_assistant_service() -> AssistantService:
-    vector_store = InMemoryVectorStore()
+    embeddings = LangChainEmbeddingClient().embeddings
     return AssistantService(
-        llm_client=OllamaClient(),
+        llm_client=LangChainOllamaClient(),
         query_engine=QueryEngine(),
         rule_parser=RuleBasedParser(),
         filter_normalizer=FilterNormalizer(),
         ranking_engine=RankingEngine(),
-        embedding_client=EmbeddingClient(),
-        retriever=StudentRetriever(vector_store=vector_store),
+        retriever=ChromaStudentRetriever(
+            embeddings=embeddings,
+            persist_directory=".chroma_student_db",
+        ),
+        memory_service=ChatMemoryService(window_size=7),
+        student_repository=StudentRepository(),
     )

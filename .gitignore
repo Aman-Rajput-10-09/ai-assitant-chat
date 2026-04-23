@@ -1,0 +1,7 @@
+
+.DS_Store
+.chroma_student_db/
+.env
+.venv
+.venv311
+__pycache__/

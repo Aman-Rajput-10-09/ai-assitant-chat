@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.env
+.venv
+.venv311
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.chroma_student_db/
